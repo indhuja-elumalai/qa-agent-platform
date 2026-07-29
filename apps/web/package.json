@@ -1,0 +1,26 @@
+{
+  "name": "@qa/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port ${PORT:-3000}",
+    "build": "next build",
+    "start": "next start --port ${PORT:-3000}",
+    "clean": "rm -rf .next"
+  },
+  "dependencies": {
+    "@qa/orchestrator": "workspace:*",
+    "@qa/persistence": "workspace:*",
+    "@qa/reporting": "workspace:*",
+    "@qa/schemas": "workspace:*",
+    "@qa/security": "workspace:*",
+    "@qa/shared": "workspace:*",
+    "@qa/test-planning": "workspace:*",
+    "@playwright/test": "^1.54.2",
+    "next": "^15.4.5",
+    "pino": "^9.7.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "zod": "^3.25.76"
+  }
+}

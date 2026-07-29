@@ -1,0 +1,40 @@
+services:
+  web:
+    build: .
+    command: ["bash", "-lc", "corepack pnpm --filter @qa/web start"]
+    environment:
+      PORT: 3000
+      QA_DATA_DIR: /app/var
+      QA_DATABASE_PATH: /app/var/qa-platform.db
+      QA_ALLOWED_TARGET_HOSTS: demo-target,localhost,127.0.0.1
+      QA_ALLOWED_REPOSITORY_ROOTS: /repositories
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - qa-data:/app/var
+      - "${QA_REPOSITORY_MOUNT:-.}:/repositories:ro"
+    shm_size: 1gb
+    depends_on:
+      demo-target:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  demo-target:
+    build: .
+    command: ["bash", "-lc", "corepack pnpm --filter @qa/demo-target start"]
+    environment:
+      DEMO_TARGET_PORT: 3100
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3100/login"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  qa-data:

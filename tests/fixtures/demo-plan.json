@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "test-plan/v1",
+  "description": "Demonstration cases for the isolated demo target",
+  "cases": [
+    "Page loads at /login.",
+    "The Login button is visible.",
+    "Empty email is rejected as required.",
+    "Invalid credentials show \"Invalid credentials\".",
+    "Protected route /dashboard redirects to /login.",
+    "Successful login reaches /dashboard.",
+    "The Agent workspace navigation card reaches /agent.",
+    "The safe form reports required-field validation."
+  ]
+}
