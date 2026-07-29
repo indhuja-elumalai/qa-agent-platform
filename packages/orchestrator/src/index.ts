@@ -14,7 +14,7 @@ import { PlaywrightQaRunner, type RunnerEvent } from "@qa/qa-runner";
 import { QaStore } from "@qa/persistence";
 import { redact, validateTargetUrl } from "@qa/security";
 import { createId, getEnvironment, nowIso, type QaEnvironment } from "@qa/shared";
-import { createCandidatePlan, editPlanItem } from "@qa/test-planning";
+import { createCandidatePlan, createPlanningAdapter, editPlanItem } from "@qa/test-planning";
 
 export interface ProgressEvent {
   id: string;
@@ -71,6 +71,18 @@ export class QaOrchestrator {
     store?: QaStore,
   ) {
     this.store = store ?? new QaStore(environment.QA_DATABASE_PATH);
+  }
+
+  private planningAdapter() {
+    return createPlanningAdapter({
+      enabled: this.environment.AI_TEST_PLANNING_ENABLED,
+      provider: this.environment.AI_PROVIDER,
+      model: this.environment.AI_MODEL,
+      apiKey: this.environment.OPENAI_API_KEY,
+      timeoutMs: this.environment.AI_REQUEST_TIMEOUT_MS,
+      maxInputFiles: this.environment.AI_MAX_INPUT_FILES,
+      maxInputBytes: this.environment.AI_MAX_INPUT_BYTES,
+    });
   }
 
   private audit(
@@ -156,6 +168,7 @@ export class QaOrchestrator {
         const plan = await createCandidatePlan({
           request,
           analysis,
+          adapter: this.planningAdapter(),
           maxCases: this.environment.QA_MAX_CASES,
         });
         this.store.put("plans", plan);
@@ -186,6 +199,7 @@ export class QaOrchestrator {
     const plan = await createCandidatePlan({
       request,
       analysis,
+      adapter: this.planningAdapter(),
       maxCases: this.environment.QA_MAX_CASES,
     });
     this.store.put("plans", plan);

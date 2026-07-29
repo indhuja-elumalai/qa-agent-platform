@@ -122,12 +122,12 @@ The token is read only from the environment and is not logged or persisted. With
 
 ## AI configuration
 
-AI planning is off by default. The provider-neutral planning interface is present; rule-based planning is the tested/default adapter. Provider execution is intentionally not enabled in this slice until a reviewed provider implementation and credentials are supplied.
+AI planning is off by default. Rule-based planning remains the no-credential default. Enable the OpenAI adapter with an explicit model and server-side API key; structured proposals are Zod-validated, remain unapproved, and fall back clearly to rule-based planning if configuration or the provider fails.
 
 ```bash
-AI_TEST_PLANNING_ENABLED=false
-AI_PROVIDER=
-AI_MODEL=
+AI_TEST_PLANNING_ENABLED=true
+AI_PROVIDER=openai
+AI_MODEL=your-approved-model
 OPENAI_API_KEY=
 ```
 
@@ -160,7 +160,7 @@ read-only at `/repositories`. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 - UI plan editing covers the title, route, and expected result; rich inline step editing is not included
 - Chat context lives in the current browser draft; it is not a multi-user conversation store
 - GitHub connector fetches a bounded selected file set and supports the first 100 PR files
-- AI provider execution is interface/configuration only; no provider call was made
+- AI provider tests are mocked; live API calls require explicit configuration and were not run
 - Comparison UI is limited to opening historical runs side by side manually
 - Browser credentials supplied through environment adapters are interface-ready but the demo uses only no-auth and storage state
 
