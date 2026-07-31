@@ -8,6 +8,7 @@ const envSchema = z.object({
   QA_DATA_DIR: z.string().default("./var"),
   QA_DATABASE_PATH: z.string().default("./var/qa-platform.db"),
   QA_ALLOWED_REPOSITORY_ROOTS: z.string().default(""),
+  QA_ALLOWED_CONFIGURATION_ROOTS: z.string().default("./config/pilots"),
   QA_ALLOWED_TARGET_HOSTS: z.string().default("localhost,127.0.0.1"),
   QA_MAX_SCAN_FILES: z.coerce.number().int().positive().default(5000),
   QA_MAX_SCAN_FILE_BYTES: z.coerce.number().int().positive().default(524288),
@@ -36,6 +37,10 @@ export function getEnvironment(input: NodeJS.ProcessEnv = process.env) {
     QA_DATA_DIR: resolve(parsed.QA_DATA_DIR),
     QA_DATABASE_PATH: resolve(parsed.QA_DATABASE_PATH),
     QA_ALLOWED_REPOSITORY_ROOTS: parsed.QA_ALLOWED_REPOSITORY_ROOTS.split(",")
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .map((value) => resolve(value)),
+    QA_ALLOWED_CONFIGURATION_ROOTS: parsed.QA_ALLOWED_CONFIGURATION_ROOTS.split(",")
       .map((value) => value.trim())
       .filter(Boolean)
       .map((value) => resolve(value)),

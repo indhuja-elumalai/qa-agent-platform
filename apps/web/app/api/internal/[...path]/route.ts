@@ -20,7 +20,7 @@ const requestInputSchema = z.object({
   source: repositorySourceSchema,
   existingCasesText: z.string().max(50_000).default(""),
   estimatedManualMinutes: z.number().nonnegative().optional(),
-  configurationFile: z.string().optional(),
+  configurationFile: z.string().max(4096).optional(),
 });
 const decisionSchema = z.object({ decision: z.enum(["approve", "reject"]) });
 const approvalSchema = z.object({ stagingApprovedItemIds: z.array(z.string()).default([]) });

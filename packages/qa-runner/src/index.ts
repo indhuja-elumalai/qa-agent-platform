@@ -9,7 +9,7 @@ import {
 } from "@playwright/test";
 import type { Action, EvidenceItem, TestPlanItem, TestResult } from "@qa/schemas";
 import { actionSchema } from "@qa/schemas";
-import { enforceSameBaseHost, redact, safeFilename } from "@qa/security";
+import { enforceSameBaseHost, redact, safeFilename, SafetyError } from "@qa/security";
 import { createId, nowIso } from "@qa/shared";
 
 const maxBrowserLogEntries = 200;
@@ -18,12 +18,14 @@ const browserLogTruncated = "[browser log truncated]";
 
 export interface AuthenticationAdapter {
   readonly name: string;
+  readonly containsSensitiveState?: boolean;
   contextOptions(): Promise<{ storageState?: string }>;
   prepare?(page: Page, baseUrl: string): Promise<void>;
 }
 
 export class NoAuthenticationAdapter implements AuthenticationAdapter {
-  readonly name = "none";
+  readonly name: string = "none";
+  readonly containsSensitiveState: boolean = false;
   async contextOptions() {
     return {};
   }
@@ -31,14 +33,16 @@ export class NoAuthenticationAdapter implements AuthenticationAdapter {
 
 export class StorageStateAuthenticationAdapter implements AuthenticationAdapter {
   readonly name = "playwright-storage-state";
+  readonly containsSensitiveState = true;
   constructor(private readonly path: string) {}
   async contextOptions() {
     return { storageState: this.path };
   }
 }
 
-export class EnvironmentCredentialsAuthenticationAdapter implements AuthenticationAdapter {
-  readonly name = "environment-credentials";
+export class EnvironmentCredentialsAuthenticationAdapter extends NoAuthenticationAdapter {
+  override readonly name = "environment-credentials";
+  override readonly containsSensitiveState = true;
   constructor(
     private readonly options: {
       email: string;
@@ -48,13 +52,13 @@ export class EnvironmentCredentialsAuthenticationAdapter implements Authenticati
       passwordLabel?: string;
       submitName?: string;
     },
-  ) {}
-  async contextOptions() {
-    return {};
+  ) {
+    super();
   }
   async prepare(page: Page, baseUrl: string) {
     const target = enforceSameBaseHost(baseUrl, this.options.loginPath ?? "/login");
     await page.goto(target.toString(), { waitUntil: "domcontentloaded" });
+    enforceSameBaseHost(baseUrl, page.url());
     await page.getByLabel(this.options.emailLabel ?? "Email").fill(this.options.email);
     await page.getByLabel(this.options.passwordLabel ?? "Password").fill(this.options.password);
     await page.getByRole("button", { name: this.options.submitName ?? "Login" }).click();
@@ -192,6 +196,32 @@ async function abortable<T>(operation: Promise<T>, signal?: AbortSignal): Promis
   });
 }
 
+async function guardDocumentNavigations(context: BrowserContext, baseUrl: string) {
+  const allowedOrigin = new URL(baseUrl).origin;
+  let blockedUrl: string | undefined;
+  await context.route("**/*", async (route) => {
+    const request = route.request();
+    if (
+      request.isNavigationRequest() &&
+      request.resourceType() === "document" &&
+      new URL(request.url()).origin !== allowedOrigin
+    ) {
+      blockedUrl = request.url();
+      await route.abort("blockedbyclient");
+      return;
+    }
+    await route.continue();
+  });
+  return () => {
+    if (blockedUrl) {
+      throw new SafetyError(
+        `Cross-origin document navigation to ${new URL(blockedUrl).origin} was blocked`,
+        "CROSS_ORIGIN_NAVIGATION",
+      );
+    }
+  };
+}
+
 function evidenceItem(input: {
   runId: string;
   testId: string;
@@ -261,9 +291,11 @@ export class PlaywrightQaRunner {
     const requiresHumanReview =
       input.item.steps.some((step) => step.type === "captureScreenshot") &&
       input.item.steps.every((step) => step.type === "captureScreenshot" || step.type === "goto");
-    const containsSensitiveValues = input.item.steps.some(
-      (step) => step.redactValue && step.value !== undefined,
-    );
+    const auth: AuthenticationAdapter =
+      this.options.authentication ?? new NoAuthenticationAdapter();
+    const containsSensitiveValues =
+      auth.containsSensitiveState !== false ||
+      input.item.steps.some((step) => step.redactValue && step.value !== undefined);
     const directory = join(
       this.options.evidenceRoot,
       safeFilename(input.runId),
@@ -299,12 +331,12 @@ export class PlaywrightQaRunner {
       let tracingStarted = false;
       try {
         browser = await chromium.launch({ headless: true });
-        const auth: AuthenticationAdapter =
-          this.options.authentication ?? new NoAuthenticationAdapter();
         context = await browser.newContext(await auth.contextOptions());
+        const assertNoBlockedNavigation = await guardDocumentNavigations(context, input.baseUrl);
         const page = await context.newPage();
         if (auth.prepare) {
           await abortable(auth.prepare(page, input.baseUrl), input.signal);
+          assertNoBlockedNavigation();
         }
         page.on("console", (message) => appendBrowserLog(`[${message.type()}] ${message.text()}`));
         page.on("pageerror", (error) => appendBrowserLog(`[pageerror] ${error.message}`));
@@ -321,10 +353,12 @@ export class PlaywrightQaRunner {
             }),
             input.signal,
           );
+          assertNoBlockedNavigation();
         }
         for (const action of input.item.steps) {
           if (input.signal?.aborted) throw new DOMException("Cancelled", "AbortError");
           await abortable(executeAction(page, action, input.baseUrl), input.signal);
+          assertNoBlockedNavigation();
           input.onEvent?.({
             type: "action-completed",
             testId: input.item.id,

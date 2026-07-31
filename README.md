@@ -111,6 +111,14 @@ QA_ALLOWED_REPOSITORY_ROOTS=/Users/example/work,/srv/read-only-repositories
 
 The connector canonicalises paths, resolves symlinks, ignores Git/dependency/build/secret/binary paths, enforces limits, reads source text and metadata only, and invokes only fixed read-only `git` commands. It never runs package scripts. For strongest containment in containers, mount target repositories read-only.
 
+## Pilot configuration and authentication
+
+Pilot profiles are validated JSON files beneath `QA_ALLOWED_CONFIGURATION_ROOTS` (default: `./config/pilots`). They bind an application to one test/staging target, an optional local repository, permitted routes, prohibited browser actions, authentication references, and artifact-retention metadata. Values that can vary by environment are referenced by environment-variable name and are never stored in the profile.
+
+The `configurationFile` request field activates the profile. The server validates the request again before approval and execution. Supported authentication adapters are `none`, `playwright-storage-state`, and `environment-credentials`; credentials and storage state are resolved server-side for each run. Screenshots, traces, and browser logs are suppressed when authenticated state is present.
+
+`config/pilots/kog-agent2.disabled.json` is a disabled template only. Enable it only after the approved non-production hostname, repository mount, route policy, retention period, and referenced secret variables have been confirmed.
+
 ## GitHub read-only mode
 
 ```bash

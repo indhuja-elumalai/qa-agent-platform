@@ -201,7 +201,7 @@ export const qaRequestSchema = z.object({
   source: repositorySourceSchema,
   existingCasesText: z.string().max(50_000).default(""),
   estimatedManualMinutes: z.number().nonnegative().max(100_000).optional(),
-  configurationFile: z.string().optional(),
+  configurationFile: z.string().max(4096).optional(),
   createdAt: z.string().datetime(),
 });
 

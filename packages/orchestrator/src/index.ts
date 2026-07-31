@@ -10,11 +10,25 @@ import { planApprovalSchema, qaRequestSchema, qaRunSchema, testPlanSchema } from
 import { createReport, writeReports } from "@qa/reporting";
 import { analyzeRepository } from "@qa/repository-analysis";
 import { GitHubRepositoryConnector, LocalRepositoryConnector } from "@qa/repository-connectors";
-import { PlaywrightQaRunner, type RunnerEvent } from "@qa/qa-runner";
+import { PlaywrightQaRunner, type AuthenticationAdapter, type RunnerEvent } from "@qa/qa-runner";
 import { QaStore } from "@qa/persistence";
 import { redact, validateTargetUrl } from "@qa/security";
 import { createId, getEnvironment, nowIso, type QaEnvironment } from "@qa/shared";
 import { createCandidatePlan, createPlanningAdapter, editPlanItem } from "@qa/test-planning";
+import {
+  createPilotAuthentication,
+  loadPilotConfiguration,
+  validatePlanItemAgainstPilot,
+  validateRequestAgainstPilot,
+} from "./pilot-configuration";
+
+export {
+  createPilotAuthentication,
+  loadPilotConfiguration,
+  pilotConfigurationSchema,
+  validatePlanItemAgainstPilot,
+  validateRequestAgainstPilot,
+} from "./pilot-configuration";
 
 export interface ProgressEvent {
   id: string;
@@ -25,6 +39,12 @@ export interface ProgressEvent {
   timestamp: string;
   data?: unknown;
 }
+
+const createRequestSchema = qaRequestSchema.omit({
+  schemaVersion: true,
+  id: true,
+  createdAt: true,
+});
 
 export class JobQueue {
   private readonly controllers = new Map<string, AbortController>();
@@ -69,6 +89,7 @@ export class QaOrchestrator {
   constructor(
     private readonly environment: QaEnvironment = getEnvironment(),
     store?: QaStore,
+    private readonly environmentVariables: Record<string, string | undefined> = process.env,
   ) {
     this.store = store ?? new QaStore(environment.QA_DATABASE_PATH);
   }
@@ -105,9 +126,18 @@ export class QaOrchestrator {
   }
 
   createRequest(input: Omit<QaRequest, "schemaVersion" | "id" | "createdAt">) {
-    validateTargetUrl(input.baseUrl, this.environment.QA_ALLOWED_TARGET_HOSTS);
+    const validatedInput = createRequestSchema.parse(input);
+    validateTargetUrl(validatedInput.baseUrl, this.environment.QA_ALLOWED_TARGET_HOSTS);
+    if (validatedInput.configurationFile) {
+      const pilot = loadPilotConfiguration(
+        validatedInput.configurationFile,
+        this.environment.QA_ALLOWED_CONFIGURATION_ROOTS,
+        this.environmentVariables,
+      );
+      validateRequestAgainstPilot(validatedInput, pilot);
+    }
     const request = qaRequestSchema.parse({
-      ...input,
+      ...validatedInput,
       schemaVersion: "qa-request/v1",
       id: createId("request"),
       createdAt: nowIso(),
@@ -203,7 +233,12 @@ export class QaOrchestrator {
       maxCases: this.environment.QA_MAX_CASES,
     });
     this.store.put("plans", plan);
-    this.audit("plan", plan.id, "created", { version: plan.version, adapter: "rule-based" });
+    this.audit("plan", plan.id, "created", {
+      version: plan.version,
+      adapter: this.environment.AI_TEST_PLANNING_ENABLED
+        ? "configured-ai-with-fallback"
+        : "rule-based",
+    });
     return plan;
   }
 
@@ -253,6 +288,16 @@ export class QaOrchestrator {
     );
     if (unsupported.length > 0)
       throw new Error("Plans containing prohibited side effects cannot be approved for execution");
+    const request = this.requireRequest(plan.requestId);
+    if (request.configurationFile) {
+      const pilot = loadPilotConfiguration(
+        request.configurationFile,
+        this.environment.QA_ALLOWED_CONFIGURATION_ROOTS,
+        this.environmentVariables,
+      );
+      validateRequestAgainstPilot(request, pilot);
+      for (const item of approvedItems) validatePlanItemAgainstPilot(item, pilot);
+    }
     const missingStagingApproval = approvedItems.filter(
       (item) =>
         item.sideEffectLevel === "STAGING_TEST_DATA" && !stagingApprovedItemIds.includes(item.id),
@@ -289,6 +334,13 @@ export class QaOrchestrator {
       throw new Error("An exact-version plan approval is required before execution");
     const request = this.requireRequest(plan.requestId);
     validateTargetUrl(request.baseUrl, this.environment.QA_ALLOWED_TARGET_HOSTS);
+    const pilot = request.configurationFile
+      ? loadPilotConfiguration(
+          request.configurationFile,
+          this.environment.QA_ALLOWED_CONFIGURATION_ROOTS,
+          this.environmentVariables,
+        )
+      : undefined;
     let selectedIds = approval.approvedItemIds;
     if (options.failuresOnly) {
       if (!options.parentRunId) throw new Error("Failure rerun requires a parent run");
@@ -298,6 +350,16 @@ export class QaOrchestrator {
         .map((result) => result.testId);
       if (selectedIds.length === 0) throw new Error("Parent run has no failed cases");
     }
+    if (pilot) {
+      validateRequestAgainstPilot(request, pilot);
+      const selectedIdSet = new Set(selectedIds);
+      for (const item of plan.items) {
+        if (selectedIdSet.has(item.id)) validatePlanItemAgainstPilot(item, pilot);
+      }
+    }
+    const authentication = pilot
+      ? createPilotAuthentication(pilot, this.environmentVariables)
+      : undefined;
     const run = qaRunSchema.parse({
       schemaVersion: "qa-run/v1",
       id: createId("run"),
@@ -317,7 +379,7 @@ export class QaOrchestrator {
     this.audit("run", run.id, "queued", { planId, planVersion: plan.version, selectedIds });
     this.jobs.publish(run.id, { runId: run.id, phase: "queued", message: "Approved run queued" });
     this.jobs.enqueue(run.id, (signal) =>
-      this.executeRun({ run, plan, request, approval, selectedIds, signal }),
+      this.executeRun({ run, plan, request, approval, selectedIds, authentication, signal }),
     );
     return run;
   }
@@ -328,6 +390,7 @@ export class QaOrchestrator {
     request: QaRequest;
     approval: PlanApproval;
     selectedIds: string[];
+    authentication?: AuthenticationAdapter;
     signal: AbortSignal;
   }) {
     const timeoutSignal = AbortSignal.timeout(this.environment.QA_RUN_TIMEOUT_MS);
@@ -343,6 +406,7 @@ export class QaOrchestrator {
       evidenceRoot: `${this.environment.QA_DATA_DIR}/evidence`,
       timeoutMs: this.environment.QA_BROWSER_TIMEOUT_MS,
       retries: this.environment.QA_ACTION_RETRIES,
+      authentication: input.authentication,
     });
     const selectedIds = new Set(input.selectedIds);
     const stagingApprovedIds = new Set(input.approval.stagingApprovedItemIds);
