@@ -1,10 +1,13 @@
-import { access, mkdtemp, readFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { createServer } from "node:http";
+import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
 import { QaOrchestrator } from "@qa/orchestrator";
 import { QaStore } from "@qa/persistence";
-import type { QaRun } from "@qa/schemas";
+import { PlaywrightQaRunner, type AuthenticationAdapter } from "@qa/qa-runner";
+import { testPlanItemSchema, type QaRun } from "@qa/schemas";
 import { getEnvironment } from "@qa/shared";
 
 test("creates, approves, executes and reports a chat-derived demo plan", async ({
@@ -61,6 +64,192 @@ test("demo target enforces login validation and protected routes", async ({ page
   await expect(page).toHaveURL(/\/dashboard$/);
   await page.getByRole("link", { name: /Agent workspace/ }).click();
   await expect(page).toHaveURL(/\/agent$/);
+});
+
+test("uses pilot authentication per run without retaining authenticated artifacts", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qa-auth-pilot-e2e-"));
+  const configurationFile = join(root, "pilot.json");
+  await writeFile(
+    configurationFile,
+    JSON.stringify({
+      schemaVersion: "qa-pilot-configuration/v1",
+      enabled: true,
+      application: { name: "Authenticated demo" },
+      environment: {
+        kind: "STAGING",
+        baseUrlEnv: "PILOT_BASE_URL",
+        expectedHost: "127.0.0.1",
+      },
+      source: { mode: "NONE" },
+      auth: {
+        adapter: "environment-credentials",
+        emailEnv: "PILOT_EMAIL",
+        passwordEnv: "PILOT_PASSWORD",
+      },
+      safety: {
+        permittedRoutes: ["/login", "/dashboard"],
+        prohibitedActions: [],
+        allowProductionMutation: false,
+        allowExternalSideEffects: false,
+      },
+      retention: { artifactDays: 1 },
+    }),
+    { mode: 0o600 },
+  );
+  const environment = getEnvironment({
+    NODE_ENV: "test",
+    QA_DATA_DIR: root,
+    QA_DATABASE_PATH: join(root, "qa.db"),
+    QA_ALLOWED_CONFIGURATION_ROOTS: root,
+    QA_ALLOWED_TARGET_HOSTS: "127.0.0.1",
+    QA_BROWSER_TIMEOUT_MS: "10000",
+    QA_RUN_TIMEOUT_MS: "30000",
+    QA_ACTION_RETRIES: "0",
+  });
+  const variables = {
+    PILOT_BASE_URL: "http://127.0.0.1:3100",
+    PILOT_EMAIL: "demo@example.test",
+    PILOT_PASSWORD: "demo-password",
+  };
+  const store = new QaStore(environment.QA_DATABASE_PATH);
+  const orchestrator = new QaOrchestrator(environment, store, variables);
+  try {
+    const request = orchestrator.createRequest({
+      workflow: "MANUAL",
+      applicationName: "Authenticated demo",
+      baseUrl: variables.PILOT_BASE_URL,
+      environment: "STAGING",
+      objective: "Validate a protected route with server-side authentication",
+      source: { schemaVersion: "repository-source/v1", mode: "NONE" },
+      existingCasesText: "Page loads /dashboard.",
+      configurationFile,
+    });
+    const plan = await orchestrator.createPlan(request.id);
+    orchestrator.decidePlanItem(plan.id, "TEST-001", "approve");
+    orchestrator.approvePlan(plan.id);
+    const queued = orchestrator.startRun(plan.id);
+    await expect
+      .poll(() => store.get<QaRun>("runs", queued.id), { timeout: 30_000 })
+      .toMatchObject({ status: "COMPLETED" });
+    const result = store.get<QaRun>("runs", queued.id)!.results[0]!;
+    expect(result.status).toBe("PASS");
+    const sensitiveArtifacts = result.evidence.filter((item) =>
+      ["SCREENSHOT", "TRACE"].includes(item.type),
+    );
+    expect(sensitiveArtifacts).toHaveLength(2);
+    for (const artifact of sensitiveArtifacts) {
+      expect(artifact.available).toBe(false);
+      await expect(access(artifact.path)).rejects.toThrow();
+    }
+    const browserLog = result.evidence.find((item) => item.type === "BROWSER_LOG")!;
+    expect(await readFile(browserLog.path, "utf8")).toMatch(/REDACTED/);
+    expect(JSON.stringify(store.list("requests"))).not.toContain(variables.PILOT_PASSWORD);
+  } finally {
+    store.close();
+  }
+});
+
+test("treats legacy authentication adapters as sensitive by default", async () => {
+  const root = await mkdtemp(join(tmpdir(), "qa-legacy-auth-e2e-"));
+  const legacyAuthentication: AuthenticationAdapter = {
+    name: "legacy-authentication-adapter",
+    async contextOptions() {
+      return {};
+    },
+  };
+  const runner = new PlaywrightQaRunner({
+    evidenceRoot: root,
+    timeoutMs: 10_000,
+    retries: 0,
+    authentication: legacyAuthentication,
+  });
+  const item = testPlanItemSchema.parse({
+    schemaVersion: "test-plan-item/v1",
+    id: "TEST-001",
+    source: "USER",
+    title: "Login button is visible",
+    category: "Authentication",
+    route: "/login",
+    steps: [
+      {
+        type: "assertElementVisible",
+        strategy: "role",
+        role: "button",
+        name: "Login",
+      },
+    ],
+    expectedResult: "The Login button is visible.",
+    assertionType: "assertElementVisible",
+  });
+
+  const result = await runner.runCase({
+    runId: "legacy-auth-run",
+    item,
+    baseUrl: "http://127.0.0.1:3100",
+  });
+  expect(result.status).toBe("PASS");
+  const sensitiveArtifacts = result.evidence.filter((evidence) =>
+    ["SCREENSHOT", "TRACE"].includes(evidence.type),
+  );
+  expect(sensitiveArtifacts).toHaveLength(2);
+  for (const artifact of sensitiveArtifacts) {
+    expect(artifact.available).toBe(false);
+    await expect(access(artifact.path)).rejects.toThrow();
+  }
+});
+
+test("blocks cross-origin navigation initiated by a click", async () => {
+  const server = createServer((_request, response) => {
+    response.setHeader("Content-Type", "text/html");
+    response.end('<a href="https://example.com">Leave the target</a>');
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("Expected a TCP test server");
+  const root = await mkdtemp(join(tmpdir(), "qa-cross-origin-e2e-"));
+  const runner = new PlaywrightQaRunner({
+    evidenceRoot: root,
+    timeoutMs: 10_000,
+    retries: 0,
+    authentication: {
+      name: "sensitive-test-adapter",
+      async contextOptions() {
+        return {};
+      },
+    },
+  });
+  const item = testPlanItemSchema.parse({
+    schemaVersion: "test-plan-item/v1",
+    id: "TEST-001",
+    source: "USER",
+    title: "Cross-origin links remain blocked",
+    category: "Navigation safety",
+    route: "/",
+    steps: [
+      {
+        type: "click",
+        strategy: "role",
+        role: "link",
+        name: "Leave the target",
+      },
+    ],
+    expectedResult: "Cross-origin navigation is blocked",
+    assertionType: "navigation",
+  });
+
+  try {
+    const result = await runner.runCase({
+      runId: "cross-origin-run",
+      item,
+      baseUrl: `http://127.0.0.1:${address.port}`,
+    });
+    expect(result.status).toBe("FAIL");
+    expect(result.actualResult).toMatch(/blocked|abort|navigation|closed/i);
+  } finally {
+    server.close();
+    await once(server, "close");
+  }
 });
 
 test("keeps numbered user cases separate from inferred validation warnings", async ({ page }) => {

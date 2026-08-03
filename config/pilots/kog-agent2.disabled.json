@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "qa-pilot-configuration/v1",
+  "enabled": false,
+  "application": {
+    "name": "kog-agent2"
+  },
+  "environment": {
+    "kind": "STAGING",
+    "baseUrlEnv": "KOG_AGENT2_BASE_URL",
+    "expectedHost": "replace-with-approved-staging-host.example"
+  },
+  "source": {
+    "mode": "LOCAL",
+    "repositoryPathEnv": "KOG_AGENT2_REPOSITORY_PATH"
+  },
+  "auth": {
+    "adapter": "playwright-storage-state",
+    "storageStateEnv": "KOG_STORAGE_STATE_PATH"
+  },
+  "safety": {
+    "permittedRoutes": ["/"],
+    "prohibitedActions": [],
+    "allowProductionMutation": false,
+    "allowExternalSideEffects": false
+  },
+  "retention": {
+    "artifactDays": 14
+  }
+}

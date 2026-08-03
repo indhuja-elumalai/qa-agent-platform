@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -8,7 +8,7 @@ import type { QaEnvironment } from "@qa/shared";
 
 const stores: QaStore[] = [];
 
-async function setup() {
+async function setup(environmentVariables: Record<string, string | undefined> = {}) {
   const root = await mkdtemp(join(tmpdir(), "qa-orchestrator-"));
   const environment = {
     PORT: 3000,
@@ -16,6 +16,7 @@ async function setup() {
     QA_DATA_DIR: root,
     QA_DATABASE_PATH: join(root, "qa.db"),
     QA_ALLOWED_REPOSITORY_ROOTS: [root],
+    QA_ALLOWED_CONFIGURATION_ROOTS: [root],
     QA_ALLOWED_TARGET_HOSTS: ["localhost", "127.0.0.1"],
     QA_MAX_SCAN_FILES: 100,
     QA_MAX_SCAN_FILE_BYTES: 100_000,
@@ -36,7 +37,7 @@ async function setup() {
   } satisfies QaEnvironment;
   const store = new QaStore(environment.QA_DATABASE_PATH);
   stores.push(store);
-  return new QaOrchestrator(environment, store);
+  return { service: new QaOrchestrator(environment, store, environmentVariables), root };
 }
 
 afterEach(() => {
@@ -45,7 +46,7 @@ afterEach(() => {
 
 describe("orchestrator approval integration", () => {
   it("converts manual cases to a plan and refuses unapproved execution", async () => {
-    const service = await setup();
+    const { service } = await setup();
     const request = service.createRequest({
       workflow: "MANUAL",
       applicationName: "Demo",
@@ -64,7 +65,7 @@ describe("orchestrator approval integration", () => {
   });
 
   it("editing after approval invalidates exact-version execution", async () => {
-    const service = await setup();
+    const { service } = await setup();
     const request = service.createRequest({
       workflow: "MANUAL",
       applicationName: "Demo",
@@ -85,7 +86,7 @@ describe("orchestrator approval integration", () => {
   });
 
   it("blocks prohibited side effects and requires explicit staging-data approval", async () => {
-    const service = await setup();
+    const { service } = await setup();
     const request = service.createRequest({
       workflow: "MANUAL",
       applicationName: "Demo",
@@ -108,5 +109,69 @@ describe("orchestrator approval integration", () => {
     service.decidePlanItem(staged.id, "TEST-001", "approve");
     expect(() => service.approvePlan(staged.id)).toThrow(/Additional staging approval/);
     expect(() => service.approvePlan(staged.id, ["TEST-001"])).not.toThrow();
+  });
+
+  it("validates request fields before reading a pilot configuration", async () => {
+    const { service } = await setup();
+    expect(() =>
+      service.createRequest({
+        workflow: "MANUAL",
+        applicationName: "Demo",
+        baseUrl: "http://localhost:3100",
+        environment: "LOCAL",
+        objective: "Check Login",
+        source: { schemaVersion: "repository-source/v1", mode: "NONE" },
+        existingCasesText: "The Login button is visible.",
+        configurationFile: "x".repeat(4097),
+      }),
+    ).toThrow(/4096/);
+  });
+
+  it("revalidates selected items when pilot policy changes after approval", async () => {
+    const { service, root } = await setup({ PILOT_BASE_URL: "http://localhost:3100" });
+    const configurationFile = join(root, "pilot.json");
+    const writePilot = (permittedRoutes: string[]) =>
+      writeFile(
+        configurationFile,
+        JSON.stringify({
+          schemaVersion: "qa-pilot-configuration/v1",
+          enabled: true,
+          application: { name: "Pilot application" },
+          environment: {
+            kind: "STAGING",
+            baseUrlEnv: "PILOT_BASE_URL",
+            expectedHost: "localhost",
+          },
+          source: { mode: "NONE" },
+          auth: { adapter: "none" },
+          safety: {
+            permittedRoutes,
+            prohibitedActions: [],
+            allowProductionMutation: false,
+            allowExternalSideEffects: false,
+          },
+          retention: { artifactDays: 1 },
+        }),
+        { mode: 0o600 },
+      );
+    await writePilot(["/safe"]);
+    const request = service.createRequest({
+      workflow: "MANUAL",
+      applicationName: "Pilot application",
+      baseUrl: "http://localhost:3100",
+      environment: "STAGING",
+      objective: "Check the safe route",
+      source: { schemaVersion: "repository-source/v1", mode: "NONE" },
+      existingCasesText: "Page loads /safe.",
+      configurationFile,
+    });
+    const plan = await service.createPlan(request.id);
+    service.decidePlanItem(plan.id, "TEST-001", "approve");
+    service.approvePlan(plan.id);
+
+    await writePilot(["/changed-policy"]);
+
+    expect(() => service.startRun(plan.id)).toThrow(/route outside.*allowlist/);
+    expect(service.store.list("runs")).toHaveLength(0);
   });
 });
